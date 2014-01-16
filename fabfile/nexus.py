@@ -1,19 +1,26 @@
-__author__ = 'storjm'
-
 from fabric.api import *
 from fabric.contrib.files import exists as fabric_exists
-import os, defaults
-import datetime
+from fabric.contrib.files import sed as fabric_sed
+from fabric.contrib.files import uncomment as fabric_uncomment
+import os, datetime
+
+import defaults, open_jdk, nginx
+
+__all__ = ['install', 'create_user', 'setup_startup_script', 'start_nexus', 'stop_nexus', 'backup_existing_install']
 
 env.user = 'ubuntu'
 
 
 @task
-def install(rsync_remote_install_path=None,
-            nexus_username=defaults.nexus_user,
-            download_url=defaults.download_url,
-            install_dir=defaults.install_dir):
-    print("TODO: install/upgrade nexus")
+def install(nexus_username=defaults.nexus_user,
+             download_url=defaults.download_url,
+             install_dir=defaults.install_dir,
+             migrate_from=None,
+             install_jdk=True,
+             install_nginx=True):
+
+    # need java to run nexus
+    open_jdk.install()
 
     # if nexus is already running, stop it
     stop_nexus()
@@ -31,48 +38,27 @@ def install(rsync_remote_install_path=None,
         'working_dir': "working",
         'nexus_current_dir_name': 'nexus-current',
         'nexus_old_dir_name': 'nexus-old-' + today,
-        'rsync_remote_install_path': rsync_remote_install_path
+        'migrate_from': migrate_from,
+        'sym_linked_nexus_dir': '/usr/local/nexus'
     }
 
-    # do the install work
-    with cd(install_dir):
-        # download the tar.gz file (-L follows redirects since the url may redirect to the actual file)
-        sudo('curl -L -o %(zip_file)s %(download_url)s' % install_options)
+    # get the pakage to install
+    install_options['created_dir'] = download_and_extract(install_dir, install_options)
 
-        # create a working directory
-        sudo('mkdir -p %(working_dir)s' % install_options)
+    # backup any existing install files
+    backup_existing_install(install_dir, install_options)
 
-        # extract the downloaded file
-        sudo('tar xvzf %(zip_file)s -C %(working_dir)s' % install_options)
+    # setup/install the downloaded version
+    setup_downloaded_version(install_dir, install_options)
 
-        # get the extracted directory name
-        with cd(install_options['working_dir']):
-            install_options['created_dir'] = os.path.join(install_options['working_dir'], sudo('ls | grep nexus'))
+    # migrate previous install config / packages
+    migrate_previous_install(install_dir, install_options, migrate_from)
 
-        # move the current nexus install into a backup dir
-        if fabric_exists(install_options['nexus_current_dir_name']):
-            sudo('mv %(nexus_current_dir_name)s %(nexus_old_dir_name)s' % install_options)
-
-        # move the extracted directory from the working directory to the correct one
-        sudo('mv %(created_dir)s %(nexus_current_dir_name)s' % install_options)
-
-        # copy over the nexus conf dir
-        if rsync_remote_install_path is not None:
-            sudo('rsync -pr %(rsync_remote_install_path)s/conf %(nexus_current_dir_name)s/conf' % install_options)
-            sudo('rsync -pr %(rsync_remote_install_path)s/../sonatype-work/nexus/conf %(nexus_current_dir_name)s/../sonatype-work' % install_options)
-
-        elif fabric_exists(install_options['nexus_current_dir_name']):
-            sudo('rsync -pr %(nexus_old_dir_name)s/conf %(nexus_current_dir_name)s/conf' % install_options)
-
-        # recreate nexus symlink
-        if fabric_exists('/usr/local/nexus'):
-            sudo('rm /usr/local/nexus')
-
-        with cd('/usr/local'):
-            sudo('ln -s ' + install_dir + '/%(nexus_current_dir_name)s nexus' % install_options)
-
-    # create starup script
-    create_startup_script(install_dir, install_options['nexus_current_dir_name'])
+    # make sure the startup script is in place
+    setup_startup_script(install_dir,
+                         install_options['nexus_current_dir_name'],
+                         install_options['sym_linked_nexus_dir'],
+                         nexus_username)
 
     # make sure the nexus user owns everything in the install directory
     update_ownership(nexus_username, install_dir)
@@ -84,8 +70,8 @@ def install(rsync_remote_install_path=None,
     with settings(warn_only=True):
         sudo('rm -rf ' + install_dir + '/' + install_options['working_dir'])
 
-    # install nginx
-    install_nginx()
+    nginx.install()
+
 
 @task
 def create_user(username=defaults.nexus_user, home_dir=defaults.install_dir):
@@ -101,21 +87,17 @@ def create_user(username=defaults.nexus_user, home_dir=defaults.install_dir):
     update_ownership(username, home_dir)
 
 
-def backup_conf_dir(install_dir=defaults.install_dir):
-    # Important: Before upgrading, back up "sonatype-work/nexus/conf".  If you need to downgrade
-    # for some reason, shut down the new server, restore the "conf" directory, and start up the old Nexus.
+@task
+def backup_existing_install(install_dir, install_options):
 
-    backup_dir = 'sonatype-work/nexus/conf/ ' + 'conf-backup-' + datetime.datetime.now().strftime("%m-%d-%y-")
-
-    with settings(warn_only=True):
-        with cd(install_dir):
-            sudo('cp -rf sonatype-work/nexus/conf/ ' + backup_dir)
-
+    with cd(install_dir):
+        # move the current nexus install into a backup dir
+        if fabric_exists(install_options['nexus_current_dir_name']):
+            sudo('mv %(nexus_current_dir_name)s %(nexus_old_dir_name)s' % install_options)
 
 @task
-def create_startup_script(install_dir, nexus_current_dir_name):
+def setup_startup_script(install_dir, nexus_current_dir_name, sym_linked_nexus_dir, nexus_username):
     full_current_dir = os.path.join(install_dir, nexus_current_dir_name)
-    #full_current_dir = install_dir + "/" + nexus_current_dir_name
     startup_script_path = os.path.join(full_current_dir, 'bin/nexus')
 
     if not fabric_exists('/etc/init.d/nexus'):
@@ -124,22 +106,31 @@ def create_startup_script(install_dir, nexus_current_dir_name):
             sudo('chmod 755 /etc/init.d/nexus')
             sudo('update-rc.d nexus defaults')
 
-    """ TODO:
+    # Edit the init script changing the following variables:
+    #    * Change NEXUS_HOME to the absolute folder location e.g. NEXUS_HOME="/usr/local/nexus"
+    #    * Set the RUN_AS_USER to nexus or any other user with restricted rights that you want to use to run the service
+    #
+    # update nexus home first
+    before = 'NEXUS_HOME=\".+\"'
+    after = 'NEXUS_HOME=\"' + sym_linked_nexus_dir + '\"'
+    fabric_sed(startup_script_path, before, after, use_sudo=True, backup='.bak')
 
-        Edit the init script changing the following variables:
+    # make sure the RUN_AS_USER variable is not commented out
+    fabric_uncomment(startup_script_path, 'RUN_AS_USER=', use_sudo=True, char='#', backup='.bak')
 
-        Change NEXUS_HOME to the absolute folder location e.g. NEXUS_HOME="/usr/local/nexus"
-        Set the RUN_AS_USER to nexus or any other user with restricted rights that you want to use to run the service. You should not be running Nexus as root.
-        Change PIDDIR to a directory where this user has read/write permissions. In most Linux distributions, /var/run is only writable by root. The properties you need to add to customize the PID file location is "wrapper.pid". For more information about this property and how it would be configured in wrapper.conf, see: http://wrapper.tanukisoftware.com/doc/english/properties.html
+    # now update RUN_AS_USER
+    before = '^\s*RUN_AS_USER=.*'
+    after = 'RUN_AS_USER=\"' + nexus_username + '\"'
+    fabric_sed(startup_script_path, before, after, use_sudo=True, backup='.bak')
 
-    """
 
-
+@task
 def stop_nexus():
     with settings(warn_only=True):
         sudo('service nexus stop')
 
 
+@task
 def start_nexus():
     sudo('service nexus start')
 
@@ -152,5 +143,49 @@ def update_ownership(nexus_user, directory):
     sudo('chown -R %(username)s:%(username)s %(home_dir)s' % user_info)
 
 
-def install_nginx():
-    print('TODO: install nginx')
+def download_and_extract(install_dir, install_options):
+
+    with cd(install_dir):
+        # download the tar.gz file (-L follows redirects since the url may redirect to the actual file)
+        sudo('curl -L -o %(zip_file)s %(download_url)s' % install_options)
+
+        # create a working directory
+        sudo('mkdir -p %(working_dir)s' % install_options)
+
+        # extract the downloaded file
+        sudo('tar xvzf %(zip_file)s -C %(working_dir)s' % install_options)
+
+        # get the extracted directory name
+        with cd(install_options['working_dir']):
+            return os.path.join(install_options['working_dir'], sudo('ls | grep nexus'))
+
+
+def setup_downloaded_version(install_dir, install_options):
+
+    with cd(install_dir):
+        # move the extracted directory from the working directory to the correct one
+        sudo('mv %(created_dir)s %(nexus_current_dir_name)s' % install_options)
+
+        symlink = install_options['sym_linked_nexus_dir']
+
+        # delete the symlink if it exists
+        if fabric_exists(symlink):
+            sudo('rm ' + symlink)
+
+        # recreate nexus symlink
+        parent_dir = os.path.dirname(symlink)
+        print(parent_dir)
+        with cd(parent_dir):
+            sudo('ln -s ' + install_dir + '/%(nexus_current_dir_name)s nexus' % install_options)
+
+
+def migrate_previous_install(install_dir, install_options, migrate_from):
+
+    with cd(install_dir):
+        # copy over the nexus conf dir
+        if migrate_from is not None:
+            sudo('mkdir -p %(nexus_current_dir_name)s/../sonatype-work' % install_options)
+            sudo('rsync -pr %(migrate_from)s/conf %(nexus_current_dir_name)s/conf && rsync -pr %(migrate_from)s/../sonatype-work %(nexus_current_dir_name)s/../sonatype-work' % install_options)
+
+        elif fabric_exists(install_options['nexus_current_dir_name']):
+            sudo('rsync -pr %(nexus_old_dir_name)s/conf %(nexus_current_dir_name)s/conf' % install_options)
