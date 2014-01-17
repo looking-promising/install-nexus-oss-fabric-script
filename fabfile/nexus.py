@@ -185,7 +185,7 @@ def migrate_previous_install(install_dir, install_options, migrate_from):
         # copy over the nexus conf dir
         if migrate_from is not None:
             sudo('mkdir -p %(nexus_current_dir_name)s/../sonatype-work' % install_options)
-            sudo('rsync -pr %(migrate_from)s/conf %(nexus_current_dir_name)s/conf && rsync -pr %(migrate_from)s/../sonatype-work %(nexus_current_dir_name)s/../sonatype-work' % install_options)
+            sudo('rsync -pr %(migrate_from)s/conf %(nexus_current_dir_name)s/conf && rsync -pr %(migrate_from)s/../sonatype-work %(nexus_current_dir_name)s/..' % install_options)
 
         elif fabric_exists(install_options['nexus_current_dir_name']):
             sudo('rsync -pr %(nexus_old_dir_name)s/conf %(nexus_current_dir_name)s/conf' % install_options)
